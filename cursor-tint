@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""cursor-tint: the Bibata Modern cursor in any color, rebuilt in about a second.
+
+usage:
+  cursor-tint FILL [OUTLINE] [options]
+
+  FILL       body color, e.g. '#f3bc7e' (the accent)
+  OUTLINE    edge color; default: black or white, whichever contrasts with FILL
+
+options:
+  --spinner A,B,C,D   the four segments of the busy spinner (default: shades of FILL)
+  --disc COLOR        disc behind the spinner (default: OUTLINE)
+  --name NAME         theme name (default: Tint-<hash of the colors>, so every color is a new theme
+                      and nothing is stuck in a cache; older Tint-* builds are removed, the previous one kept)
+  --sizes 24,32,48    nominal sizes to render (default 24,32,48,64,96)
+  --size N            cursor size to apply (default 24)
+  --apply             switch to it: hyprctl setcursor, gsettings, ~/.local/share/icons/default
+  --dir DIR           where themes go (default ~/.local/share/icons)
+
+prints the theme name. needs python3 with Pillow and resvg or rsvg-convert.
+"""
+import argparse
+import glob
+import hashlib
+import io
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
+
+from PIL import Image
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SRC_CANDIDATES = [os.path.join(HERE, "src"), "/usr/share/cursor-tint", os.path.expanduser("~/.local/share/cursor-tint")]
+# Placeholder colors in the Bibata SVGs: body, edge, spinner disc, spinner segments.
+FILL, OUTLINE, DISC = "#00FF00", "#0000FF", "#FF0000"
+SPIN = ("#32A0DA", "#7EBA41", "#F05024", "#FCB813")
+
+
+def rgb(h):
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        sys.exit(f"cursor-tint: not a color: {h}")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def hexs(c):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(x))) for x in c)
+
+
+def mix(a, b, t):
+    return hexs(tuple(x + (y - x) * t for x, y in zip(rgb(a), rgb(b))))
+
+
+def luminance(h):
+    def ch(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (ch(v) for v in rgb(h))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def renderer():
+    if shutil.which("resvg"):
+        return lambda svg, size: subprocess.run(
+            ["resvg", "-w", str(size), "-h", str(size), "-", "-c"], input=svg, capture_output=True, check=True).stdout
+    if shutil.which("rsvg-convert"):
+        return lambda svg, size: subprocess.run(
+            ["rsvg-convert", "-w", str(size), "-h", str(size)], input=svg, capture_output=True, check=True).stdout
+    sys.exit("cursor-tint: needs resvg or rsvg-convert (librsvg)")
+
+
+def argb(png):
+    """PNG -> premultiplied ARGB, little-endian 0xAARRGGBB words (bytes B, G, R, A), as Xcursor wants."""
+    im = Image.open(io.BytesIO(png)).convert("RGBA").convert("RGBa")
+    r, g, b, a = im.split()
+    return im.width, im.height, Image.merge("RGBA", (b, g, r, a)).tobytes()
+
+
+def xcursor(images):
+    """images: (nominal, width, height, xhot, yhot, delay, pixels) per frame and size."""
+    toc, chunks, pos = b"", b"", 16 + 12 * len(images)
+    for nominal, w, h, xh, yh, delay, px in images:
+        chunk = struct.pack("<9I", 36, 0xFFFD0002, nominal, 1, w, h, xh, yh, delay) + px
+        toc += struct.pack("<3I", 0xFFFD0002, nominal, pos)
+        chunks += chunk
+        pos += len(chunk)
+    return struct.pack("<4sIII", b"Xcur", 16, 0x10000, len(images)) + toc + chunks
+
+
+def build(src, out_dir, name, colors, sizes):
+    with open(f"{src}/x.build.toml", "rb") as f:
+        conf = tomllib.load(f)["cursors"]
+    fb = conf.pop("fallback_settings")
+
+    frames = {}
+    for key, c in conf.items():
+        png = c["png"]
+        frames[key] = (sorted(glob.glob(f"{src}/svg/{png.split('-*')[0]}/*.svg")) if "*" in png
+                       else [f"{src}/svg/{png[:-4]}.svg"])
+
+    svgs = {}
+    for paths in frames.values():
+        for p in paths:
+            if p not in svgs:
+                with open(p) as f:
+                    text = f.read()
+                for a, b in colors:
+                    text = text.replace(a, b).replace(a.lower(), b)
+                svgs[p] = text.encode()
+
+    render = renderer()
+    jobs = [(p, s) for p in svgs for s in sizes]
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        done = dict(zip(jobs, pool.map(lambda j: argb(render(svgs[j[0]], j[1])), jobs)))
+
+    os.makedirs(out_dir, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=f".{name}-", dir=out_dir)
+    os.makedirs(f"{tmp}/cursors")
+    for key, c in conf.items():
+        xh, yh = c.get("x_hotspot", fb["x_hotspot"]), c.get("y_hotspot", fb["y_hotspot"])
+        delay = c.get("x11_delay", fb.get("x11_delay", 40))
+        images = [(s, *done[(p, s)][:2], round(xh * s / 256), round(yh * s / 256), delay, done[(p, s)][2])
+                  for s in sizes for p in frames[key]]
+        target = c.get("x11_name", key)
+        with open(f"{tmp}/cursors/{target}", "wb") as f:
+            f.write(xcursor(images))
+        for link in c.get("x11_symlinks", []):
+            if not os.path.lexists(f"{tmp}/cursors/{link}"):
+                os.symlink(target, f"{tmp}/cursors/{link}")
+    with open(f"{tmp}/index.theme", "w") as f:
+        f.write(f"[Icon Theme]\nName={name}\nComment=Bibata Modern, recolored by cursor-tint\nInherits=hicolor\n")
+    final = f"{out_dir}/{name}"
+    if os.path.exists(final):
+        shutil.rmtree(final)
+    os.rename(tmp, final)
+
+
+def apply(out_dir, name, size):
+    home = os.path.expanduser("~")
+    default = f"{home}/.local/share/icons/default"
+    os.makedirs(default, exist_ok=True)
+    with open(f"{default}/index.theme", "w") as f:
+        f.write(f"[Icon Theme]\nName=Default\nComment=Set by cursor-tint\nInherits={name}\n")
+    if shutil.which("gsettings"):
+        schema = "org.gnome.desktop.interface"
+        subprocess.run(["gsettings", "set", schema, "cursor-theme", name], capture_output=True)
+        subprocess.run(["gsettings", "set", schema, "cursor-size", str(size)], capture_output=True)
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):
+        subprocess.run(["hyprctl", "setcursor", name, str(size)], capture_output=True)
+    env = [f"XCURSOR_THEME={name}", f"XCURSOR_SIZE={size}"]
+    subprocess.run(["systemctl", "--user", "set-environment", *env], capture_output=True)
+    if shutil.which("dbus-update-activation-environment"):
+        subprocess.run(["dbus-update-activation-environment", *env], capture_output=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("fill", nargs="?")
+    ap.add_argument("outline", nargs="?")
+    ap.add_argument("--spinner")
+    ap.add_argument("--disc")
+    ap.add_argument("--name")
+    ap.add_argument("--sizes", default="24,32,48,64,96")
+    ap.add_argument("--size", type=int, default=24)
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--dir", default=os.path.expanduser("~/.local/share/icons"))
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help or not a.fill:
+        print(__doc__.strip())
+        sys.exit(0 if a.help else 2)
+
+    src = next((d for d in SRC_CANDIDATES if os.path.isfile(f"{d}/x.build.toml")), None)
+    if not src:
+        sys.exit("cursor-tint: Bibata sources not found (src/ next to the script)")
+
+    fill = hexs(rgb(a.fill))
+    outline = hexs(rgb(a.outline)) if a.outline else ("#000000" if luminance(fill) > 0.35 else "#ffffff")
+    disc = hexs(rgb(a.disc)) if a.disc else outline
+    if a.spinner:
+        spin = [hexs(rgb(c)) for c in a.spinner.split(",")]
+        if len(spin) != 4:
+            sys.exit("cursor-tint: --spinner takes four colors")
+    else:
+        spin = [fill, mix(fill, "#ffffff", 0.45), mix(fill, disc, 0.3), mix(fill, "#ffffff", 0.8)]
+    colors = [(FILL, fill), (OUTLINE, outline), (DISC, disc), *zip(SPIN, spin)]
+    sizes = [int(s) for s in a.sizes.split(",")]
+
+    auto = not a.name
+    name = a.name or "Tint-" + hashlib.sha1(" ".join([fill, outline, disc, *spin, a.sizes]).encode()).hexdigest()[:8]
+    if not os.path.isdir(f"{a.dir}/{name}/cursors") or not auto:
+        build(src, a.dir, name, colors, sizes)
+    if auto:
+        # Keep this build and the one in use right now (running apps may still hold it).
+        current = ""
+        try:
+            with open(os.path.expanduser("~/.local/share/icons/default/index.theme")) as f:
+                current = next((l.split("=", 1)[1].strip() for l in f if l.startswith("Inherits=")), "")
+        except OSError:
+            pass
+        for old in glob.glob(f"{a.dir}/Tint-*"):
+            if os.path.basename(old) not in (name, current):
+                shutil.rmtree(old, ignore_errors=True)
+    if a.apply:
+        apply(a.dir, name, a.size)
+    print(name)
+
+
+main()
